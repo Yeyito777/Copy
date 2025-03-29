@@ -1,0 +1,195 @@
+#!/bin/bash
+
+# --- Configuration ---
+EXCLUDE_GLOBS=()
+
+# --- Script Logic ---
+# Check for exactly one argument
+if [ "$#" -ne 1 ]; then echo "Usage: copy <path/to/file_or_folder>" >&2; exit 1; fi
+TARGET_PATH="$1"
+if [ ! -e "$TARGET_PATH" ]; then echo "Error: Path '$TARGET_PATH' does not exist." >&2; exit 1; fi
+
+# --- Determine which clipboard command to use ---
+CLIPBOARD_CMD=""
+if [[ -n "$WAYLAND_DISPLAY" ]] && command -v wl-copy &> /dev/null; then CLIPBOARD_CMD="wl-copy"
+elif [[ -n "$DISPLAY" ]] && command -v xclip &> /dev/null; then CLIPBOARD_CMD="xclip -selection clipboard"
+elif command -v wl-copy &> /dev/null && ! command -v xclip &> /dev/null; then echo "Warning: Only wl-copy found, but no Wayland session detected. Attempting anyway..." >&2; CLIPBOARD_CMD="wl-copy"
+elif command -v xclip &> /dev/null && ! command -v wl-copy &> /dev/null; then CLIPBOARD_CMD="xclip -selection clipboard"
+fi
+if [[ -z "$CLIPBOARD_CMD" ]]; then
+  echo "Error: Could not determine appropriate clipboard command." >&2
+  echo "Please ensure you are running in a graphical session (X11 or Wayland)" >&2
+  echo "and have the corresponding clipboard tool installed:" >&2
+  echo "  - For X11: 'xclip' (sudo pacman -S xclip)" >&2
+  echo "  - For Wayland: 'wl-copy' (sudo pacman -S wl-clipboard)" >&2
+  if [[ -z "$DISPLAY" ]] && [[ -z "$WAYLAND_DISPLAY" ]]; then
+      echo "Neither \$DISPLAY nor \$WAYLAND_DISPLAY environment variables are set." >&2
+  fi
+  exit 1
+fi
+
+# --- Handle FILE ---
+if [ -f "$TARGET_PATH" ]; then
+  case "$TARGET_PATH" in
+    *.png|*.jpg|*.jpeg|*.gif|*.webp|*.avif|*.ico|*.svg|\
+    *.mp4|*.mov|*.avi|*.mkv|*.webm|*.wmv|*.flv|\
+    *.mp3|*.wav|*.ogg|*.flac|*.aac|*.m4a|*.opus|\
+    *.zip|*.tar|*.gz|*.bz2|*.xz|*.7z|*.rar|*.iso|\
+    *.pdf|*.doc|*.docx|*.xls|*.xlsx|*.ppt|*.pptx|*.odt|*.ods|*.odp|\
+    *.bin|*.exe|*.dll|*.so|*.appimage|*.dmg|*.pkg|*.deb|*.rpm)
+      echo "Warning: '$TARGET_PATH' appears to be a non-text file. Skipping copy." >&2
+      exit 0 ;;
+    *)
+      $CLIPBOARD_CMD < "$TARGET_PATH"
+      CLIP_STATUS=${PIPESTATUS[0]:-1} # Check status of clipboard command
+      if [ $CLIP_STATUS -eq 0 ]; then echo "Copied content of file '$TARGET_PATH' to clipboard."
+      else echo "Error: Failed to copy content of '$TARGET_PATH' to clipboard (Exit code: $CLIP_STATUS)." >&2; exit 1; fi ;;
+  esac
+  exit 0
+fi
+
+# --- Handle FOLDER ---
+if [ -d "$TARGET_PATH" ]; then
+  if ! command -v rg &> /dev/null; then echo "Error: 'rg' (ripgrep) is required..." >&2; exit 1; fi
+
+  ( # Start Subshell
+    cd "$TARGET_PATH" || { echo "Error: Could not enter directory '$TARGET_PATH'." >&2; exit 1; }
+
+    USE_TYPES=false
+    RG_ARGS=("--files" "--null")
+
+    if $USE_TYPES && rg --type-list &>/dev/null; then
+        echo "Scanning '$TARGET_PATH' (excluding types)..." >&2
+        RG_ARGS+=("--type-not" image "--type-not" video "--type-not" audio "--type-not" archive "--type-not" binary "--type-not" pdf)
+    else
+        echo "Scanning '$TARGET_PATH' (excluding extensions)..." >&2
+        RG_ARGS+=("--glob" "!*.png" "--glob" "!*.jpg" "--glob" "!*.jpeg" "--glob" "!*.gif" "--glob" "!*.webp" "--glob" "!*.avif" "--glob" "!*.ico" "--glob" "!*.svg")
+        RG_ARGS+=("--glob" "!*.mp4" "--glob" "!*.mov" "--glob" "!*.avi" "--glob" "!*.mkv" "--glob" "!*.webm" "--glob" "!*.wmv" "--glob" "!*.flv")
+        RG_ARGS+=("--glob" "!*.mp3" "--glob" "!*.wav" "--glob" "!*.ogg" "--glob" "!*.flac" "--glob" "!*.aac" "--glob" "!*.m4a" "--glob" "!*.opus")
+        RG_ARGS+=("--glob" "!*.zip" "--glob" "!*.tar" "--glob" "!*.gz" "--glob" "!*.bz2" "--glob" "!*.xz" "--glob" "!*.7z" "--glob" "!*.rar" "--glob" "!*.iso")
+        RG_ARGS+=("--glob" "!*.pdf" "--glob" "!*.doc" "--glob" "!*.docx" "--glob" "!*.xls" "--glob" "!*.xlsx" "--glob" "!*.ppt" "--glob" "!*.pptx" "--glob" "!*.odt" "--glob" "!*.ods" "--glob" "!*.odp")
+        RG_ARGS+=("--glob" "!*.bin" "--glob" "!*.exe" "--glob" "!*.dll" "--glob" "!*.so" "--glob" "!*.appimage" "--glob" "!*.dmg" "--glob" "!*.pkg" "--glob" "!*.deb" "--glob" "!*.rpm")
+    fi
+    for glob in "${EXCLUDE_GLOBS[@]}"; do RG_ARGS+=("--glob" "!$glob"); done
+
+    # --- Find files and process ---
+    TMP_COMBINED=$(mktemp)
+    trap 'rm -f "$TMP_COMBINED"' EXIT HUP INT QUIT TERM
+
+    # SIMPLEST REDIRECTION: Capture combined stdout/stderr directly from sh
+    rg "${RG_ARGS[@]}" . | xargs -0 --no-run-if-empty sh -c '
+        overall_status=0 # Track if any cat command fails
+        first_file=true # Flag to avoid separator before the first file
+        # Loop through filenames passed as arguments ($1, $2, ...)
+        for file do
+            # Add separator *before* the next file, except for the very first one
+            if [ "$first_file" = true ]; then
+                first_file=false
+            else
+                # Print the prominent separator to STDOUT
+                printf "\n\n#--------------------------------------#\n# File Separator\n#--------------------------------------#\n\n"
+            fi
+
+            # Print filename header to STDOUT
+            printf "[%s]\n" "$file"
+
+            # Execute cat, send its stdout to sh stdout, send its stderr to sh stderr
+            cat "$file"
+            cat_status=$?
+
+            if [ "$cat_status" -ne 0 ]; then
+                # Print error marker to STDERR
+                printf "CAT_ERROR_MARKER File: %s Exit: %s\n" "$file" "$cat_status" >&2
+                overall_status=1 # Record that at least one error occurred
+            fi
+            # Removed the simple printf "\n" here, separation is handled before the next header
+        done
+        # Exit the sh script with the overall status
+        exit "$overall_status"
+    ' sh > "$TMP_COMBINED" 2>&1 # Redirect sh stdout (fd 1) and stderr (fd 2) to temp file
+
+    # --- Status Checking ---
+    RG_STATUS=${PIPESTATUS[0]:-1}
+    XARGS_EXIT_CODE=${PIPESTATUS[1]:-1} # Store xargs exit code, but use cautiously
+
+    COMBINED_OUTPUT=$(<"$TMP_COMBINED")
+    rm -f "$TMP_COMBINED"
+    trap - EXIT HUP INT QUIT TERM
+
+    # Separate CONTENT from ERRORS based on the marker within the combined output
+    CAT_ERR_OUTPUT=$(printf '%s\n' "$COMBINED_OUTPUT" | grep "^CAT_ERROR_MARKER" || true)
+    CONTENT=$(printf '%s\n' "$COMBINED_OUTPUT" | grep -v "^CAT_ERROR_MARKER" || true)
+
+    # Determine if processing had errors based *only* on finding cat error markers
+    PROCESSING_HAD_ERROR=false
+    if [ -n "$CAT_ERR_OUTPUT" ]; then
+        PROCESSING_HAD_ERROR=true
+    fi
+
+    # --- Reporting and Action ---
+
+    # 1. Handle ripgrep errors
+    if [ "$RG_STATUS" -gt 1 ]; then
+        echo "Error: ripgrep failed with exit code $RG_STATUS while searching in '$TARGET_PATH'." >&2
+        exit 1
+    fi
+
+    # 2. Handle ripgrep finding no files
+    if [ "$RG_STATUS" -eq 1 ]; then
+        echo "No matching text files found in '$TARGET_PATH' to copy."
+        exit 0
+    fi
+
+    # If we reach here, RG_STATUS must be 0
+
+    # 3. Report processing errors if any cat failed
+    if $PROCESSING_HAD_ERROR; then
+        echo "Warning: One or more files could not be fully processed (cat errors detected). Output might be incomplete." >&2
+        echo "--- Detected Cat Errors ---" >&2
+        echo "$CAT_ERR_OUTPUT" | sed 's/^CAT_ERROR_MARKER /Warning: cat failed for /; s/ Exit: / (exit code /; s/$/)/' >&2
+        echo "--- End Cat Errors ---" >&2
+
+        if [ -z "$CONTENT" ]; then
+            echo "No valid content was successfully processed or copied due to the cat error(s)." >&2
+            exit 1
+        fi
+    # 4. Check for non-zero xargs exit code only if no cat errors were found
+    elif [ "$XARGS_EXIT_CODE" -ne 0 ]; then
+         # echo "Debug: xargs exited with status $XARGS_EXIT_CODE, but no specific cat errors were detected. Proceeding." >&2
+         : # Treat as benign and proceed silently
+    fi
+
+
+    # 5. Proceed to copy if content exists
+    if [ -n "$CONTENT" ]; then
+        # Remove a single final newline if it exists (from the last file's content or header)
+        # This won't remove the intentional separators.
+        printf '%s' "${CONTENT%$'\n'}" | $CLIPBOARD_CMD
+        CLIP_STATUS=${PIPESTATUS[1]:-1} # Status of the clipboard command (last in *this* pipeline)
+
+        if [ "$CLIP_STATUS" -eq 0 ]; then
+            if ! $PROCESSING_HAD_ERROR; then
+                echo "Copied filenames and concatenated text content from '$TARGET_PATH' to clipboard."
+            fi
+            exit 0
+        else
+            echo "Error: Failed to copy processed content to clipboard (Clipboard command exit code: $CLIP_STATUS)." >&2
+            exit 1
+        fi
+    elif ! $PROCESSING_HAD_ERROR; then
+        echo "Warning: No content generated. Found text files might be empty." >&2
+        exit 0
+    else
+         # Error (cat failure) reported, and content is empty.
+         exit 1
+    fi
+
+  ) # End Subshell
+  SUBSHELL_STATUS=$?
+  exit $SUBSHELL_STATUS
+
+fi # End Folder Handling
+
+# --- Handle other path types ---
+echo "Error: Path '$TARGET_PATH' is not a regular file or directory." >&2
+exit 1
